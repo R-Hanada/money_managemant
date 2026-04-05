@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
 import pandas as pd
@@ -10,6 +11,7 @@ from pandas.tseries.offsets import MonthEnd
 
 DEFAULT_XLSX = "cost_managemant.xlsx"
 DEFAULT_SHEET = "cost_sheet"
+DATA_CACHE_TTL_SECONDS = 300
 FIXED_ITEMS = [
     ("服", "ゆっこ"),
     ("服", "りょう"),
@@ -40,10 +42,7 @@ def apply_mobile_friendly_style() -> None:
     )
 
 
-@st.cache_data(show_spinner=False)
-def load_cost_data() -> pd.DataFrame:
-    raw = pd.read_excel(Path(__file__).parent / DEFAULT_XLSX, sheet_name=DEFAULT_SHEET, usecols="A:H")
-
+def normalize_cost_data(raw: pd.DataFrame) -> pd.DataFrame:
     if raw.shape[1] < 7:
         raise ValueError("cost_sheet の A-H 列が不足しています。")
 
@@ -75,6 +74,18 @@ def load_cost_data() -> pd.DataFrame:
     df["month_start"] = df["date"].dt.to_period("M").dt.to_timestamp()
 
     return df
+
+
+@st.cache_data(show_spinner=False, ttl=DATA_CACHE_TTL_SECONDS)
+def load_cost_data_from_local(file_path: str) -> pd.DataFrame:
+    raw = pd.read_excel(file_path, sheet_name=DEFAULT_SHEET, usecols="A:H")
+    return normalize_cost_data(raw)
+
+
+@st.cache_data(show_spinner=False, ttl=DATA_CACHE_TTL_SECONDS)
+def load_cost_data_from_upload(uploaded_bytes: bytes) -> pd.DataFrame:
+    raw = pd.read_excel(io.BytesIO(uploaded_bytes), sheet_name=DEFAULT_SHEET, usecols="A:H")
+    return normalize_cost_data(raw)
 
 
 def get_period_windows(today: pd.Timestamp) -> dict[str, tuple[pd.Timestamp, pd.Timestamp]]:
@@ -169,13 +180,35 @@ def main() -> None:
     )
     apply_mobile_friendly_style()
 
+    control_left, control_right = st.columns([2, 1])
+    with control_left:
+        uploaded_file = st.file_uploader(
+            "データファイルをアップロード (xlsx)",
+            type=["xlsx"],
+            help="Cloud ではアップロードを使うと push なしでデータを差し替えられます。",
+        )
+    with control_right:
+        st.write("")
+        st.write("")
+        if st.button("最新データ読込", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
     default_path = Path(__file__).parent / DEFAULT_XLSX
-    if not default_path.exists():
-        st.error(f"データファイルが見つかりません: {default_path}")
+    if uploaded_file is None and not default_path.exists():
+        st.error(
+            f"データファイルが見つかりません: {default_path}。"
+            "ローカルファイルを配置するか、画面からxlsxをアップロードしてください。"
+        )
         return
 
     try:
-        df = load_cost_data()
+        if uploaded_file is not None:
+            df = load_cost_data_from_upload(uploaded_file.getvalue())
+            data_source = f"アップロード: {uploaded_file.name}"
+        else:
+            df = load_cost_data_from_local(str(default_path))
+            data_source = f"ローカル: {default_path.name}"
     except Exception as exc:
         st.error("データを読み込めませんでした。シート名 cost_sheet と A-H 列を確認してください。")
         st.exception(exc)
@@ -184,6 +217,12 @@ def main() -> None:
     if df.empty:
         st.warning("対象データがありません。")
         return
+
+    loaded_at = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.caption(
+        f"データソース: {data_source} | 最終読込: {loaded_at} | "
+        f"キャッシュTTL: {DATA_CACHE_TTL_SECONDS // 60}分"
+    )
 
     today = pd.Timestamp.today().normalize()
     summary = aggregate_for_fixed_items(df, today)
